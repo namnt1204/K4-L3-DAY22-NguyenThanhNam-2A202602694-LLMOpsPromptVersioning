@@ -1,0 +1,35 @@
+=======================================================
+  Demo: JSON Formatting & Repair
+=======================================================
+
+[Valid JSON] ✅ Pass
+  Input:  {"name": "Alice", "age": 30}
+  Output: {"name": "Alice", "age": 30}
+
+[Markdown fences] ✅ Pass
+  Input:  ```json
+{"name": "Bob"}
+```
+  Output: {
+  "name": "Bob"
+}
+
+[Single quotes] ✅ Pass
+  Input:  {'name': 'Charlie', 'score': 95}
+  Output: {
+  "name": "Charlie",
+  "score": 95
+}
+
+[Trailing comma] ✅ Pass
+  Input:  {"key": "value",}
+  Output: {
+  "key": "value"
+}
+
+[Truly invalid] ✅ Pass
+  Input:  This is not JSON at all: ??? {]
+  Output: {
+  "error": "Không thể phân tích JSON",
+  "raw": "This is not JSON at all: ??? {]"
+}

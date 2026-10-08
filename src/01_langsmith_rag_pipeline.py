@@ -39,28 +39,24 @@ def setup_vectorstore():
         chunks      = split_text(text, chunk_size=500, chunk_overlap=50)
         vectorstore = build_vectorstore(chunks, embeddings)
     """
-    # TODO: Khởi tạo embeddings từ factory (1 dòng)
-    embeddings = ...
-
-    # TODO: Đọc nội dung knowledge base (1 dòng)
-    text = ...
-
-    # TODO: Chia text thành chunks với chunk_size=500, chunk_overlap=50 (1 dòng)
-    chunks = ...
+    embeddings = get_embeddings()
+    text = load_knowledge_base()
+    chunks = split_text(text, chunk_size=500, chunk_overlap=50)
     print(f"📚 Đã chia thành {len(chunks)} chunks")
-
-    # TODO: Tạo FAISS vectorstore và trả về (1 dòng)
-    vectorstore = ...
+    vectorstore = build_vectorstore(chunks, embeddings)
     return vectorstore
 
 
 # ── 2. RAG Prompt Template ─────────────────────────────────────────────────
-# TODO: Tạo ChatPromptTemplate với 2 messages:
-#   ("system", "Bạn là trợ lý AI hữu ích. Chỉ dùng context sau để trả lời.\n\nContext:\n{context}")
-#   ("human",  "{question}")
-#
-# Gợi ý: RAG_PROMPT = ChatPromptTemplate.from_messages([...])
-RAG_PROMPT = ...
+RAG_PROMPT = ChatPromptTemplate.from_messages([
+    (
+        "system",
+        "Bạn là trợ lý AI hữu ích. Chỉ dùng context sau để trả lời. "
+        "Nếu không tìm thấy thông tin hoặc thiếu bằng chứng trong context, hãy nói rõ là không tìm thấy thông tin.\n\n"
+        "Context:\n{context}",
+    ),
+    ("human", "{question}"),
+])
 
 
 # ── 3. Build RAG Chain ─────────────────────────────────────────────────────
@@ -75,41 +71,33 @@ def build_rag_chain(vectorstore):
     Trả về: (chain, retriever)
     """
     llm = get_llm()
+    retriever = vectorstore.as_retriever(search_kwargs={"k": 3})
 
-    # TODO: Tạo retriever từ vectorstore, lấy k=3 tài liệu gần nhất
-    # Gợi ý: retriever = vectorstore.as_retriever(search_kwargs={"k": 3})
-    retriever = ...
-
-    # TODO: Định nghĩa hàm format_docs để ghép page_content của các docs thành 1 chuỗi
-    # Gợi ý: "\n\n".join(doc.page_content for doc in docs)
     def format_docs(docs):
-        ...
+        return "\n\n".join(doc.page_content for doc in docs)
 
-    # TODO: Xây dựng LCEL chain dùng pipe operator (|)
-    # Gợi ý:
-    #   chain = (
-    #       {"context": retriever | format_docs, "question": RunnablePassthrough()}
-    #       | RAG_PROMPT | llm | StrOutputParser()
-    #   )
-    chain = ...
+    chain = (
+        {"context": retriever | format_docs, "question": RunnablePassthrough()}
+        | RAG_PROMPT
+        | llm
+        | StrOutputParser()
+    )
 
     return chain, retriever
 
 
 # ── 4. Hàm Query có LangSmith Tracing ─────────────────────────────────────
-# TODO: Thêm decorator @traceable(name="rag-query", tags=["rag", "step1"])
-#       phía TRÊN chữ ký hàm để LangSmith tự động ghi lại input/output/latency
+@traceable(name="rag-query", tags=["rag", "step1"])
 def ask(chain, question: str) -> str:
     """
     Chạy RAG chain với một câu hỏi.
     Decorator @traceable sẽ gửi mỗi lần gọi lên LangSmith như một trace riêng.
     """
-    # TODO: Gọi chain.invoke(question) và trả về kết quả
-    ...
+    return chain.invoke(question)
 
 
 # ── 5. Main ────────────────────────────────────────────────────────────────
-def main():
+def main(limit: int = None):
     print("=" * 60)
     print("  Bước 1: LangSmith RAG Pipeline")
     print("=" * 60)
@@ -117,21 +105,30 @@ def main():
     if not config.validate():
         sys.exit(1)
 
-    # TODO: Gọi setup_vectorstore() để tạo vectorstore
-    vectorstore = ...
+    vectorstore = setup_vectorstore()
+    chain, retriever = build_rag_chain(vectorstore)
 
-    # TODO: Gọi build_rag_chain(vectorstore) để nhận chain và retriever
-    chain, retriever = ...
+    questions = SAMPLE_QUESTIONS[:limit] if limit else SAMPLE_QUESTIONS
+    success_count = 0
 
-    # TODO: Lặp qua tất cả SAMPLE_QUESTIONS, gọi ask(), in câu hỏi và câu trả lời
-    for i, question in enumerate(SAMPLE_QUESTIONS, 1):
-        answer = ...
-        print(f"[{i:02d}/{len(SAMPLE_QUESTIONS)}] Q: {question[:60]}")
-        print(f"       A: {str(answer)[:100]}\n")
+    import time
 
-    print(f"\n✅ {len(SAMPLE_QUESTIONS)} traces đã gửi lên LangSmith project '{config.LANGSMITH_PROJECT}'")
+    for i, question in enumerate(questions, 1):
+        print(f"[{i:02d}/{len(questions)}] Q: {question}")
+        answer = ask(chain, question)
+        success_count += 1
+        print(f"       A: {str(answer)[:120]}...\n")
+        if i < len(questions):
+            time.sleep(1)
+
+    print(f"\n📊 Tổng kết: {success_count}/{len(questions)} câu hỏi thành công.")
+    print(f"✅ {success_count} traces đã gửi lên LangSmith project '{config.LANGSMITH_PROJECT}'")
     print("   Mở https://smith.langchain.com để xem traces.")
 
 
 if __name__ == "__main__":
-    main()
+    import argparse
+    parser = argparse.ArgumentParser(description="Bước 1: LangSmith RAG Pipeline")
+    parser.add_argument("--limit", type=int, default=None, help="Số lượng câu hỏi cần chạy (dùng cho smoke test)")
+    args = parser.parse_args()
+    main(limit=args.limit)

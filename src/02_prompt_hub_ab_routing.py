@@ -1,214 +1,228 @@
-"""
-Bước 2 — Prompt Hub & A/B Routing
-===================================
-NHIỆM VỤ:
-  1. Viết 2 system prompt khác nhau (V1: ngắn gọn, V2: có cấu trúc)
-  2. Push cả 2 lên LangSmith Prompt Hub qua client.push_prompt()
-  3. Pull lại từ Hub qua client.pull_prompt()
-  4. Implement A/B routing tất định: hash(request_id) % 2 → V1 hoặc V2
-  5. Chạy 50 câu hỏi qua router → ≥ 50 LangSmith traces nữa
-
-DELIVERABLE: 2 prompt version hiển thị trong Prompt Hub trên https://smith.langchain.com
-"""
-import sys
+"""Checkpoint 2 - LangSmith Prompt Hub and deterministic A/B routing."""
+import argparse
 import hashlib
+import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-import config  # ⚠️ phải import trước LangChain
+# config must be imported before LangChain so tracing environment variables exist.
+import config
 
-from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
+from langchain_core.prompts import ChatPromptTemplate
 from langsmith import Client, traceable
+from langsmith.utils import LangSmithConflictError
 
-from utils.llm_factory import get_llm, get_embeddings
-from utils.data_loader import load_knowledge_base, split_text, build_vectorstore
 from qa_pairs import SAMPLE_QUESTIONS
+from utils.data_loader import build_vectorstore, load_knowledge_base, split_text
+from utils.llm_factory import get_embeddings, get_llm
 
 
-# ── 1. Tên Prompt trên Hub ─────────────────────────────────────────────────
-# TODO: Đổi thành tên của bạn — phải là duy nhất trong Hub của bạn
-PROMPT_V1_NAME = "my-rag-prompt-v1"   # ví dụ: "nguyen-rag-v1"
-PROMPT_V2_NAME = "my-rag-prompt-v2"   # ví dụ: "nguyen-rag-v2"
+PROMPT_V1_NAME = "namnt1204-day22-rag-v1"
+PROMPT_V2_NAME = "namnt1204-day22-rag-v2"
 
 
-# ── 2. Định nghĩa 2 Prompt Templates ──────────────────────────────────────
-# TODO: Viết SYSTEM_V1 — phong cách ngắn gọn, trả lời 2-4 câu
-# Gợi ý: "Bạn là trợ lý AI hữu ích. Chỉ dùng context sau để trả lời.
-#          Giữ câu trả lời ngắn gọn (2-4 câu). ...\n\nContext:\n{context}"
-# ⚠️ BẮT BUỘC có {context} trong SYSTEM — thiếu thì LLM không nhận được tài liệu
-#    mà chương trình KHÔNG báo lỗi (câu trả lời bịa, điểm RAGAS thấp).
-SYSTEM_V1 = ...
+SYSTEM_V1 = (
+    "You are a concise RAG assistant. Answer in 2-4 sentences using only facts "
+    "explicitly supported by the context. Do not add outside knowledge or make "
+    "unsupported inferences. If the context does not contain enough evidence, "
+    "state clearly that the information is not available in the provided context.\n\n"
+    "Context:\n{context}"
+)
+PROMPT_V1 = ChatPromptTemplate.from_messages(
+    [("system", SYSTEM_V1), ("human", "{question}")]
+)
 
-PROMPT_V1 = ChatPromptTemplate.from_messages([
-    ("system", SYSTEM_V1),
-    ("human",  "{question}"),
-])
-
-# TODO: Viết SYSTEM_V2 — phong cách có cấu trúc, expert tone, 3-5 câu
-# Gợi ý: "Bạn là chuyên gia AI. Đọc kỹ context, xác định facts liên quan,
-#          viết câu trả lời rõ ràng và có tổ chức (3-5 câu). ...\n\nContext:\n{context}"
-# ⚠️ BẮT BUỘC có {context} (giống SYSTEM_V1)
-SYSTEM_V2 = ...
-
-PROMPT_V2 = ChatPromptTemplate.from_messages([
-    ("system", SYSTEM_V2),
-    ("human",  "{question}"),
-])
-
-
-# ── 3. Push Prompts lên Prompt Hub ─────────────────────────────────────────
-def push_prompts_to_hub(client: Client):
-    """
-    Upload cả 2 prompt templates lên LangSmith Prompt Hub.
-    Gợi ý: client.push_prompt(name, object=template, description="...")
-    """
-    # TODO: Push PROMPT_V1 — bọc trong try/except để xử lý lỗi
-    try:
-        url = ...   # client.push_prompt(PROMPT_V1_NAME, object=PROMPT_V1, description="V1 – ngắn gọn")
-        print(f"✅ Đã push V1 → {url}")
-    except Exception as e:
-        print(f"⚠️  V1 lỗi: {e}")
-
-    # TODO: Push PROMPT_V2 — bọc trong try/except
-    try:
-        url = ...   # client.push_prompt(PROMPT_V2_NAME, object=PROMPT_V2, description="V2 – có cấu trúc")
-        print(f"✅ Đã push V2 → {url}")
-    except Exception as e:
-        print(f"⚠️  V2 lỗi: {e}")
+SYSTEM_V2 = (
+    "You are an evidence-focused RAG analyst. Use only information supported by "
+    "the context and prioritize a complete account of all relevant evidence. "
+    "Write a clear, structured answer in 3-5 sentences: give the direct answer "
+    "first, then the supporting details. Never speculate or invent facts; when "
+    "the evidence is insufficient, explicitly say the information is not available "
+    "in the provided context.\n\n"
+    "Context:\n{context}"
+)
+PROMPT_V2 = ChatPromptTemplate.from_messages(
+    [("system", SYSTEM_V2), ("human", "{question}")]
+)
 
 
-# ── 4. Pull Prompts từ Prompt Hub ──────────────────────────────────────────
-def pull_prompts_from_hub(client: Client) -> dict:
-    """
-    Tải 2 prompt từ LangSmith Prompt Hub.
-    Fallback về template local nếu Hub không khả dụng.
+def push_prompts_to_hub(client: Client) -> dict:
+    """Push both prompts independently and surface every real Hub error."""
+    prompt_specs = (
+        (
+            "V1",
+            PROMPT_V1_NAME,
+            PROMPT_V1,
+            "Day 22 RAG V1 - concise 2-4 sentence answers grounded strictly in context.",
+        ),
+        (
+            "V2",
+            PROMPT_V2_NAME,
+            PROMPT_V2,
+            "Day 22 RAG V2 - structured 3-5 sentence answers with complete supported evidence.",
+        ),
+    )
+    results, errors = {}, []
 
-    Gợi ý: client.pull_prompt(name) → ChatPromptTemplate
+    for label, name, prompt, description in prompt_specs:
+        try:
+            url = client.push_prompt(name, object=prompt, description=description)
+            results[name] = url
+            print(f"✅ Pushed {label} '{name}' → {url}")
+        except LangSmithConflictError as exc:
+            # A repeated run may return 409 when its manifest matches the latest
+            # commit. Ignore only that documented no-op, never other conflicts.
+            if "nothing to commit" not in str(exc).lower():
+                errors.append((name, exc))
+                print(f"❌ Failed to push {label} '{name}': {exc}")
+                continue
+            results[name] = "unchanged (already on Hub)"
+            print(f"ℹ️  {label} '{name}' unchanged; latest Hub commit retained.")
+        except Exception as exc:
+            errors.append((name, exc))
+            print(f"❌ Failed to push {label} '{name}': {exc}")
 
-    Trả về: {name: ChatPromptTemplate}
-    """
-    prompts = {}
+    if errors:
+        details = "; ".join(f"{name}: {error}" for name, error in errors)
+        raise RuntimeError(
+            f"Could not push all CP2 prompts to LangSmith Hub: {details}"
+        ) from errors[0][1]
+    return results
 
-    # TODO: Pull PROMPT_V1_NAME, fallback về PROMPT_V1 nếu lỗi
-    try:
-        prompts[PROMPT_V1_NAME] = ...   # client.pull_prompt(PROMPT_V1_NAME)
-        print(f"↓ Đã pull '{PROMPT_V1_NAME}' từ Hub")
-    except Exception:
-        prompts[PROMPT_V1_NAME] = PROMPT_V1
-        print(f"ℹ️  Dùng local fallback cho '{PROMPT_V1_NAME}'")
 
-    # TODO: Pull PROMPT_V2_NAME, fallback về PROMPT_V2 nếu lỗi
-    try:
-        prompts[PROMPT_V2_NAME] = ...   # client.pull_prompt(PROMPT_V2_NAME)
-        print(f"↓ Đã pull '{PROMPT_V2_NAME}' từ Hub")
-    except Exception:
-        prompts[PROMPT_V2_NAME] = PROMPT_V2
-        print(f"ℹ️  Dùng local fallback cho '{PROMPT_V2_NAME}'")
+def pull_prompts_from_hub(
+    client: Client, allow_local_fallback: bool = False
+) -> dict:
+    """Pull both Hub prompts; evidence mode (default) forbids local fallback."""
+    prompts, errors = {}, []
+    local_prompts = {PROMPT_V1_NAME: PROMPT_V1, PROMPT_V2_NAME: PROMPT_V2}
 
+    for name in (PROMPT_V1_NAME, PROMPT_V2_NAME):
+        try:
+            prompts[name] = client.pull_prompt(name, skip_cache=True)
+            print(f"↓ Pulled '{name}' successfully from LangSmith Hub")
+        except Exception as exc:
+            if allow_local_fallback:
+                prompts[name] = local_prompts[name]
+                print(
+                    f"⚠️  LOCAL FALLBACK for '{name}': {exc}\n"
+                    "   CP2 HUB CRITERIA NOT MET - do not use this run as evidence."
+                )
+            else:
+                errors.append((name, exc))
+                print(f"❌ Failed to pull '{name}' from Hub: {exc}")
+
+    if errors:
+        details = "; ".join(f"{name}: {error}" for name, error in errors)
+        raise RuntimeError(
+            "CP2 requires both prompts to be pulled from LangSmith Hub; " + details
+        ) from errors[0][1]
     return prompts
 
 
-# ── 5. A/B Routing tất định ────────────────────────────────────────────────
 def get_prompt_version(request_id: str) -> str:
-    """
-    Xác định prompt version dựa trên MD5 hash của request_id.
-
-    Quy tắc: hash chẵn → PROMPT_V1_NAME | hash lẻ → PROMPT_V2_NAME
-    TÍNH CHẤT: cùng request_id LUÔN cho cùng kết quả (deterministic).
-
-    Gợi ý:
-        hash_int = int(hashlib.md5(request_id.encode()).hexdigest(), 16)
-        return PROMPT_V1_NAME if hash_int % 2 == 0 else PROMPT_V2_NAME
-    """
-    # TODO: Tính MD5 hash của request_id và chuyển thành số nguyên
-    hash_int = ...
-
-    # TODO: Trả về PROMPT_V1_NAME nếu chẵn, PROMPT_V2_NAME nếu lẻ
-    ...
+    """Route an ID by MD5 parity: even to V1, odd to V2."""
+    hash_int = int(hashlib.md5(request_id.encode("utf-8")).hexdigest(), 16)
+    return PROMPT_V1_NAME if hash_int % 2 == 0 else PROMPT_V2_NAME
 
 
-# ── 6. Traced A/B Query ────────────────────────────────────────────────────
-# TODO: Thêm @traceable(name="ab-rag-query", tags=["ab-test", "step2"])
+def verify_deterministic_routing(repetitions: int = 5) -> dict:
+    """Assert repeated IDs are stable and the 50-question set covers both arms."""
+    assignments = {}
+    for i in range(len(SAMPLE_QUESTIONS)):
+        request_id = f"req-{i:04d}"
+        routed = {get_prompt_version(request_id) for _ in range(repetitions)}
+        if len(routed) != 1:
+            raise AssertionError(f"Non-deterministic routing for {request_id}: {routed}")
+        assignments[request_id] = routed.pop()
+
+    counts = {
+        PROMPT_V1_NAME: sum(v == PROMPT_V1_NAME for v in assignments.values()),
+        PROMPT_V2_NAME: sum(v == PROMPT_V2_NAME for v in assignments.values()),
+    }
+    if not all(counts.values()):
+        raise AssertionError(f"Routing sample does not cover both versions: {counts}")
+    print(
+        "✅ Deterministic routing test passed "
+        f"({repetitions} repeats/ID): V1={counts[PROMPT_V1_NAME]}, "
+        f"V2={counts[PROMPT_V2_NAME]}"
+    )
+    return counts
+
+
+@traceable(name="ab-rag-query", tags=["ab-test", "step2"])
 def ask_ab(retriever, llm, prompt, question: str, version: str) -> dict:
-    """
-    Chạy RAG chain với prompt version được chọn bởi router.
-
-    Bước:
-      a) Retrieve top-3 docs từ retriever
-      b) Ghép page_content thành context string
-      c) Chạy (prompt | llm | StrOutputParser()).invoke({"context": ..., "question": ...})
-      d) Trả về {"question": ..., "answer": ..., "version": ...}
-    """
-    # TODO: Retrieve docs từ retriever
-    docs = ...
-
-    # TODO: Ghép page_content thành 1 string (dùng "\n\n".join)
-    context = ...
-
-    # TODO: Chạy chain và lấy answer
-    answer = (prompt | llm | StrOutputParser()).invoke(...)
-
-    # TODO: Trả về dict kết quả
-    return ...
+    """Retrieve top-3 context, invoke the selected Hub prompt, and label output."""
+    docs = retriever.invoke(question)
+    context = "\n\n".join(doc.page_content for doc in docs)
+    answer = (prompt | llm | StrOutputParser()).invoke(
+        {"context": context, "question": question}
+    )
+    return {"question": question, "answer": answer, "version": version}
 
 
-# ── 7. Setup Vectorstore (tái sử dụng logic Bước 1) ───────────────────────
 def setup_vectorstore():
-    embeddings  = get_embeddings()
-    text        = load_knowledge_base()
-    chunks      = split_text(text)
+    embeddings = get_embeddings()
+    text = load_knowledge_base()
+    chunks = split_text(text)
     return build_vectorstore(chunks, embeddings)
 
 
-# ── 8. Main ────────────────────────────────────────────────────────────────
-def main():
+def main(limit: int = None):
     print("=" * 60)
-    print("  Bước 2: Prompt Hub & A/B Routing")
+    print("  Step 2: Prompt Hub & A/B Routing")
     print("=" * 60)
 
     if not config.validate():
         sys.exit(1)
 
-    # TODO: Tạo LangSmith Client với API key từ config
-    # Gợi ý: client = Client(api_key=config.LANGSMITH_API_KEY)
-    client = ...
+    verify_deterministic_routing()
+    client = Client(api_key=config.LANGSMITH_API_KEY)
+    hub_results = push_prompts_to_hub(client)
+    prompts = pull_prompts_from_hub(client, allow_local_fallback=False)
 
-    # TODO: Push cả 2 prompts lên Hub
-    push_prompts_to_hub(client)
-
-    # TODO: Pull cả 2 prompts từ Hub (dùng dict trả về)
-    prompts = ...
-
-    # Tạo vectorstore, retriever và LLM
     vectorstore = setup_vectorstore()
-    # TODO: Tạo retriever từ vectorstore (k=3)
-    retriever   = ...
-    llm         = get_llm()
+    retriever = vectorstore.as_retriever(search_kwargs={"k": 3})
+    llm = get_llm()
 
-    # Chạy A/B routing cho tất cả câu hỏi
-    v1_count, v2_count = 0, 0
-    for i, question in enumerate(SAMPLE_QUESTIONS):
-        request_id  = f"req-{i:04d}"
-
-        # TODO: Lấy version key từ request_id qua get_prompt_version()
-        version_key = ...
+    questions = SAMPLE_QUESTIONS[:limit] if limit else SAMPLE_QUESTIONS
+    v1_count, v2_count, success_count = 0, 0, 0
+    for i, question in enumerate(questions):
+        request_id = f"req-{i:04d}"
+        version_key = get_prompt_version(request_id)
         version_tag = "v1" if version_key == PROMPT_V1_NAME else "v2"
-        prompt      = prompts[version_key]
+        prompt = prompts[version_key]
 
-        # TODO: Gọi ask_ab() với đúng arguments
-        result = ...
-
+        result = ask_ab(retriever, llm, prompt, question, version_tag)
+        success_count += 1
         if version_tag == "v1":
             v1_count += 1
         else:
             v2_count += 1
-        print(f"[{i+1:02d}] [prompt-{version_tag}] {question[:55]}...")
+        print(
+            f"[{i + 1:02d}/{len(questions)}] [prompt-{result['version']}] "
+            f"{question[:55]}..."
+        )
 
-    print(f"\n📊 Routing: V1={v1_count} câu | V2={v2_count} câu | Tổng={len(SAMPLE_QUESTIONS)}")
-    print("✅ Bước 2 hoàn thành! Kiểm tra Prompt Hub và traces trên LangSmith.")
+    print(f"\n📊 Routing: V1={v1_count} | V2={v2_count} | Total={len(questions)}")
+    print(f"✅ Successful traces: {success_count}/{len(questions)}")
+    print("Hub prompts:")
+    for name, url in hub_results.items():
+        print(f"   - {name}: {url}")
+    print("✅ Step 2 complete. Check Prompt Hub and traces in LangSmith.")
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(
+        description="Step 2: Prompt Hub & deterministic A/B routing"
+    )
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="Question count for a smoke test; default runs all 50 questions.",
+    )
+    args = parser.parse_args()
+    main(limit=args.limit)

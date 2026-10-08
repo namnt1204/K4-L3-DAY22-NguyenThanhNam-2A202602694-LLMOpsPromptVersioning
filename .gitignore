@@ -1,5 +1,9 @@
-# API keys — KHÔNG BAO GIỜ commit file này
+# API keys & secrets — KHÔNG BAO GIỜ commit các file này
 .env
+.env.*
+!.env.example
+*.pem
+*.key
 
 # Python
 __pycache__/
@@ -16,6 +20,7 @@ build/
 venv/
 env/
 .venv/
+myenv/
 
 # IDE
 .vscode/
@@ -28,3 +33,5 @@ env/
 
 # Lab outputs (không commit, chỉ nộp evidence/)
 data/ragas_report.json
+data/faiss_index/
+data/checkpoints/
